@@ -16,6 +16,12 @@ from .handler import handle_plane_event, handle_pull_request
 from .plane_client import PlaneClient
 from .plane_events import parse_plane_event
 from .plane_signature import verify as verify_plane
+from .repository_registry import (
+    AmbiguousProjectMatch,
+    ProjectCandidate,
+    RepositoryRegistry,
+    suggest_project,
+)
 from .resolver import Resolver
 
 
@@ -44,6 +50,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.cfg = cfg
     app.state.plane = plane
     app.state.resolver = Resolver(plane)
+    registry = RepositoryRegistry(
+        os.environ.get("PYLON_REGISTRY_PATH", "data/pylon.sqlite3")
+    )
+    registry.initialize()
+    app.state.repository_registry = registry
     app.state.webhook_secret = _required_env("GITHUB_WEBHOOK_SECRET")
     # PLANE_WEBHOOK_SECRET is optional — when unset, the Plane
     # webhook route accepts unsigned deliveries with a startup
@@ -135,13 +146,59 @@ async def github_webhook(
         request.app.state.last_webhook["status"] = "bad_json"
         raise HTTPException(status_code=400, detail=f"invalid json: {e}")
 
+    repository = payload.get("repository") or {}
+    repository_id = repository.get("id")
+    full_name = repository.get("full_name") or ""
+    registry = request.app.state.repository_registry
+    if x_github_delivery and registry.is_delivery_processed(x_github_delivery):
+        request.app.state.last_webhook["status"] = "duplicate"
+        logger.info("duplicate webhook ignored delivery=%s", x_github_delivery)
+        return {"status": "duplicate", "delivery": x_github_delivery}
+    if isinstance(repository_id, int) and full_name:
+        registry.register_repository(
+            repository_id,
+            full_name,
+            repository.get("html_url") or "",
+        )
+        if registry.get_mapping(repository_id) is None:
+            repository_name = full_name.rsplit("/", 1)[-1]
+            raw_projects = await request.app.state.plane.list_projects()
+            projects = [
+                ProjectCandidate(
+                    id=project["id"],
+                    identifier=project["identifier"],
+                    name=project.get("name") or "",
+                )
+                for project in raw_projects
+                if project.get("id") and project.get("identifier")
+            ]
+            try:
+                suggested = suggest_project(repository_name, projects)
+            except AmbiguousProjectMatch:
+                logger.warning(
+                    "repository %s has ambiguous Plane project matches",
+                    full_name,
+                )
+            else:
+                if suggested is not None:
+                    registry.set_mapping(
+                        repository_id,
+                        suggested,
+                        source="automatic",
+                    )
+                    logger.info(
+                        "repository %s automatically mapped to Plane project %s",
+                        full_name,
+                        suggested.identifier,
+                    )
+
     event = parse_pull_request(payload)
     logger.info(
         "pull_request action=%s pr=#%s refs=%s repo=%s",
         event.action,
         event.number,
         [str(r) for r in event.refs],
-        (payload.get("repository") or {}).get("full_name") or "<unknown>",
+        full_name or "<unknown>",
     )
     try:
         await handle_pull_request(
@@ -151,6 +208,12 @@ async def github_webhook(
             request.app.state.resolver,
         )
         status = "processed"
+        if x_github_delivery:
+            registry.mark_delivery_processed(
+                x_github_delivery,
+                x_github_event,
+                repository_id if isinstance(repository_id, int) else None,
+            )
     except Exception:
         logger.exception("handler raised on pr=#%s delivery=%s", event.number, x_github_delivery)
         status = "handler_error"

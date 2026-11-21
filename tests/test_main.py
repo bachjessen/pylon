@@ -38,13 +38,53 @@ def _config() -> Config:
     )
 
 
+class FakePlane:
+    def __init__(self) -> None:
+        self.projects: list[dict] = []
+
+    async def list_projects(self) -> list[dict]:
+        return self.projects
+
+
+class FakeRepositoryRegistry:
+    def __init__(self) -> None:
+        self.registered: list[tuple[int, str, str]] = []
+        self.mappings: dict[int, object] = {}
+        self.processed_deliveries: set[str] = set()
+
+    def register_repository(
+        self, repository_id: int, full_name: str, html_url: str = ""
+    ) -> None:
+        self.registered.append((repository_id, full_name, html_url))
+
+    def get_mapping(self, repository_id: int) -> object | None:
+        return self.mappings.get(repository_id)
+
+    def set_mapping(
+        self, repository_id: int, project: object, *, source: str
+    ) -> None:
+        self.mappings[repository_id] = (project, source)
+
+    def is_delivery_processed(self, delivery_id: str) -> bool:
+        return delivery_id in self.processed_deliveries
+
+    def mark_delivery_processed(
+        self, delivery_id: str, event_type: str, repository_id: int | None = None
+    ) -> bool:
+        if delivery_id in self.processed_deliveries:
+            return False
+        self.processed_deliveries.add(delivery_id)
+        return True
+
+
 @pytest.fixture
 def configured_app(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     # Populate the state the lifespan would normally set, then bypass
     # signature verification (the bytes aren't what's under test here).
     app.state.cfg = _config()
-    app.state.plane = object()
+    app.state.plane = FakePlane()
     app.state.resolver = object()
+    app.state.repository_registry = FakeRepositoryRegistry()
     app.state.webhook_secret = "secret"
     app.state.last_webhook = {"at": None, "event": None, "status": None}
     app.state.webhook_count = 0
@@ -76,6 +116,74 @@ def test_handler_success_returns_200(
     resp = _post(configured_app, pr_merged)
     assert resp.status_code == 200
     assert resp.json()["status"] == "processed"
+
+
+def test_signed_webhook_registers_repository(
+    configured_app: TestClient, monkeypatch: pytest.MonkeyPatch, pr_merged: dict
+) -> None:
+    monkeypatch.setattr(main_mod, "handle_pull_request", _ok_handler)
+
+    resp = _post(configured_app, pr_merged)
+
+    assert resp.status_code == 200
+    repository = pr_merged["repository"]
+    assert app.state.repository_registry.registered == [
+        (
+            repository["id"],
+            repository["full_name"],
+            repository.get("html_url", ""),
+        )
+    ]
+
+
+def test_signed_webhook_automatically_maps_unambiguous_project(
+    configured_app: TestClient, monkeypatch: pytest.MonkeyPatch, pr_merged: dict
+) -> None:
+    monkeypatch.setattr(main_mod, "handle_pull_request", _ok_handler)
+    repository = pr_merged["repository"]
+    repository["full_name"] = "bachjessen/session-relay"
+    app.state.plane.projects = [
+        {"id": "project-1", "identifier": "SR", "name": "Session Relay"}
+    ]
+
+    resp = _post(configured_app, pr_merged)
+
+    assert resp.status_code == 200
+    mapping, source = app.state.repository_registry.mappings[repository["id"]]
+    assert mapping.id == "project-1"
+    assert mapping.identifier == "SR"
+    assert source == "automatic"
+
+
+def test_duplicate_delivery_is_acknowledged_without_repeating_handler(
+    configured_app: TestClient, monkeypatch: pytest.MonkeyPatch, pr_merged: dict
+) -> None:
+    calls = 0
+
+    async def counting_handler(*_a: object, **_k: object) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(main_mod, "handle_pull_request", counting_handler)
+
+    first = _post(configured_app, pr_merged)
+    duplicate = _post(configured_app, pr_merged)
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert duplicate.json() == {"status": "duplicate", "delivery": "d1"}
+    assert calls == 1
+
+
+def test_failed_delivery_is_not_marked_processed(
+    configured_app: TestClient, monkeypatch: pytest.MonkeyPatch, pr_merged: dict
+) -> None:
+    monkeypatch.setattr(main_mod, "handle_pull_request", _failing_handler)
+
+    resp = _post(configured_app, pr_merged)
+
+    assert resp.status_code == 503
+    assert "d1" not in app.state.repository_registry.processed_deliveries
 
 
 def test_handler_failure_returns_503_for_github_retry(
